@@ -1,0 +1,24 @@
+# Rust
+target/
+
+# Node / pnpm
+node_modules/
+.pnpm-store/
+dist/
+.next/
+.vercel/
+out/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp

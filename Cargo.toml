@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "contracts/vault_router",
+    "contracts/vault_flex",
+    "contracts/vault_l3",
+    "contracts/vault_l6",
+    "contracts/vault_l12",
+    "contracts/strategy_vault",
+    "contracts/harvester",
+    "contracts/governance",
+]
+resolver = "2"
