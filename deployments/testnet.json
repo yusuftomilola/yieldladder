@@ -1,0 +1,14 @@
+{
+  "network": "testnet",
+  "contracts": {
+    "VaultRouter":    "CC_PENDING_TESTNET",
+    "VaultFlex":      "CC_PENDING_TESTNET",
+    "VaultL3":        "CC_PENDING_TESTNET",
+    "VaultL6":        "CC_PENDING_TESTNET",
+    "VaultL12":       "CC_PENDING_TESTNET",
+    "StrategyVault":  "CC_PENDING_TESTNET",
+    "Harvester":      "CC_PENDING_TESTNET",
+    "Governance":     "CC_PENDING_TESTNET"
+  },
+  "deployedAt": "pending"
+}
