@@ -5,10 +5,11 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, panic_wit
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum VaultError {
-    BelowMinDeposit = 2,
-    LockNotExpired  = 3,
-    NotYetMatured   = 4,
-    Unauthorized    = 5,
+    BelowMinDeposit    = 2,
+    LockNotExpired     = 3,
+    NotYetMatured      = 4,
+    DepositCapExceeded = 5,
+    Unauthorized       = 6,
 }
 
 #[derive(Clone)]
@@ -19,16 +20,18 @@ pub enum DataKey {
     Shares(Address),
     Checkpoint(Address),
     TotalShares,
+    TotalBalance,
     Admin,
+    Governance,
     Guardian,
     Strategy,
     Usdc,
+    MaxTvl,
     /// Emergency unlock flag — when true, early_exit and withdraw skip
     /// lock and fee enforcement so depositors can exit safely.
     EmergencyUnlock,
 }
 
-// GF-01 internal mock: fixed-point math
 const FP_MULTIPLIER: i128 = 1_000_000_0;
 
 pub fn mul_fp(a: i128, b_fp: i128) -> i128 {
@@ -38,19 +41,35 @@ pub fn mul_fp(a: i128, b_fp: i128) -> i128 {
 // 3-month lock duration in ledgers (~5 s/ledger)
 const LOCK_DURATION: u32 = 777_600;
 
+// Conservative default cap: 1,000,000 USDC (7 decimals)
+const DEFAULT_MAX_TVL: i128 = 1_000_000_0_000_000;
+
 #[contract]
 pub struct VaultL3;
 
 #[contractimpl]
 impl VaultL3 {
-    pub fn initialize(env: Env, admin: Address, guardian: Address, strategy: Address, usdc: Address) {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        governance: Address,
+        guardian: Address,
+        strategy: Address,
+        usdc: Address,
+        max_tvl: i128,
+    ) {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Governance, &governance);
         env.storage().instance().set(&DataKey::Guardian, &guardian);
         env.storage().instance().set(&DataKey::Strategy, &strategy);
         env.storage().instance().set(&DataKey::Usdc, &usdc);
         env.storage().instance().set(&DataKey::TotalShares, &0i128);
+        env.storage().instance().set(&DataKey::TotalBalance, &0i128);
         env.storage().instance().set(&DataKey::EmergencyUnlock, &false);
+        // Use provided cap, falling back to DEFAULT_MAX_TVL if zero
+        let cap = if max_tvl > 0 { max_tvl } else { DEFAULT_MAX_TVL };
+        env.storage().instance().set(&DataKey::MaxTvl, &cap);
     }
 
     // ── Emergency Unlock ─────────────────────────────────────────────────────
@@ -85,6 +104,13 @@ impl VaultL3 {
             panic_with_error!(&env, VaultError::BelowMinDeposit);
         }
 
+        // TVL cap check: reject if deposit would push total balance over max_tvl
+        let total_balance: i128 = env.storage().instance().get(&DataKey::TotalBalance).unwrap_or(0);
+        let max_tvl: i128 = env.storage().instance().get(&DataKey::MaxTvl).unwrap_or(DEFAULT_MAX_TVL);
+        if total_balance + amount > max_tvl {
+            panic_with_error!(&env, VaultError::DepositCapExceeded);
+        }
+
         let multiplier_fp = 10_500_000;
         let new_shares = mul_fp(amount, multiplier_fp);
 
@@ -102,6 +128,7 @@ impl VaultL3 {
 
         let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalShares, &(total_shares + new_shares));
+        env.storage().instance().set(&DataKey::TotalBalance, &(total_balance + amount));
 
         let lock_until = env.ledger().sequence() + LOCK_DURATION;
         env.storage().persistent().set(&DataKey::LockUntil(user.clone()), &lock_until);
@@ -134,7 +161,9 @@ impl VaultL3 {
         }
 
         let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
+        let total_balance: i128 = env.storage().instance().get(&DataKey::TotalBalance).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalShares, &(total_shares - current_shares));
+        env.storage().instance().set(&DataKey::TotalBalance, &(total_balance - principal).max(0));
 
         env.storage().persistent().remove(&DataKey::Balance(user.clone()));
         env.storage().persistent().remove(&DataKey::Shares(user.clone()));
@@ -170,7 +199,9 @@ impl VaultL3 {
         };
 
         let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
+        let total_balance: i128 = env.storage().instance().get(&DataKey::TotalBalance).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalShares, &(total_shares - current_shares));
+        env.storage().instance().set(&DataKey::TotalBalance, &(total_balance - principal).max(0));
 
         env.storage().persistent().remove(&DataKey::Balance(user.clone()));
         env.storage().persistent().remove(&DataKey::Shares(user.clone()));
@@ -178,6 +209,25 @@ impl VaultL3 {
         env.storage().persistent().remove(&DataKey::Checkpoint(user.clone()));
 
         net_amount
+    }
+
+    /// Update the max TVL cap. Only callable by the registered Governance address.
+    /// Lowering the cap below current TVL does not affect existing depositors —
+    /// it only prevents new deposits that would exceed the new cap.
+    pub fn set_max_tvl(env: Env, new_cap: i128) {
+        let governance: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        governance.require_auth();
+        env.storage().instance().set(&DataKey::MaxTvl, &new_cap);
+    }
+
+    pub fn max_tvl(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::MaxTvl).unwrap_or(DEFAULT_MAX_TVL)
+    }
+
+    pub fn remaining_capacity(env: Env) -> i128 {
+        let max_tvl: i128 = env.storage().instance().get(&DataKey::MaxTvl).unwrap_or(DEFAULT_MAX_TVL);
+        let total_balance: i128 = env.storage().instance().get(&DataKey::TotalBalance).unwrap_or(0);
+        (max_tvl - total_balance).max(0)
     }
 
     /// Renew the lock on a matured position without touching Balance or Shares.
@@ -223,6 +273,10 @@ impl VaultL3 {
 
     pub fn total_shares(env: Env) -> i128 {
         env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0)
+    }
+
+    pub fn total_balance(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::TotalBalance).unwrap_or(0)
     }
 }
 
